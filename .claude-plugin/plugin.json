@@ -1,0 +1,11 @@
+{
+  "name": "cc-demon",
+  "version": "0.1.0",
+  "description": "Daemon scheduler and channel gateway for Claude Code - run scheduled jobs and communicate through Telegram",
+  "author": {
+    "name": "Phu Nguyen"
+  },
+  "repository": "https://github.com/phunguyen/cc-demon",
+  "license": "Apache-2.0",
+  "keywords": ["daemon", "cron", "scheduler", "telegram", "gateway", "automation"]
+}

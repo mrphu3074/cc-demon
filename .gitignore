@@ -1,0 +1,20 @@
+# Rust
+/target
+**/*.rs.bk
+# Cargo.lock is committed for binary projects
+
+# Plugin settings
+.claude/*.local.md
+
+# Daemon runtime
+.demon/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
