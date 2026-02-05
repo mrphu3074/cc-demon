@@ -1,7 +1,7 @@
 # CC-Demon
 
 <p align="center">
-  <img src="images/logo.png" alt="CC-Demon Logo" width="300">
+  <img src="images/logo.png" alt="CC-Demon Logo" width="500">
 </p>
 
 **Daemon scheduler and Telegram gateway for Claude Code.**
