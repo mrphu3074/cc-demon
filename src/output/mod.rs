@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Local;
 
 use crate::config::{DemonConfig, Job};
+use crate::gateway::TelegramClient;
 
 pub async fn route(job: &Job, result: &str, config: &DemonConfig) -> Result<()> {
     for dest in &job.output_destinations {
@@ -59,19 +60,13 @@ async fn send_to_telegram(
     }
 
     let bot = teloxide::Bot::new(&config.gateway.bot_token);
+    let client = TelegramClient::new(bot, config.gateway.message_format);
     let text = format!("**Job: {}**\n\n{}", job.name, extract_result(result));
 
-    // Split if needed (Telegram 4096 char limit)
-    let chunks = split_message(&text, 4000);
-    for chunk in chunks {
-        teloxide::requests::Requester::send_message(
-            &bot,
-            teloxide::types::ChatId(chat_id),
-            chunk.to_string(),
-        )
+    client
+        .send_formatted_message(teloxide::types::ChatId(chat_id), &text)
         .await
         .context("Failed to send Telegram message")?;
-    }
 
     tracing::info!("Output sent to Telegram chat: {}", chat_id);
     Ok(())
@@ -88,26 +83,4 @@ fn extract_result(result: &str) -> &str {
         }
     }
     result
-}
-
-fn split_message(text: &str, max_len: usize) -> Vec<&str> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < text.len() {
-        let end = (start + max_len).min(text.len());
-        let split_at = if end < text.len() {
-            text[start..end]
-                .rfind('\n')
-                .map(|i| start + i + 1)
-                .unwrap_or(end)
-        } else {
-            end
-        };
-
-        chunks.push(&text[start..split_at]);
-        start = split_at;
-    }
-
-    chunks
 }

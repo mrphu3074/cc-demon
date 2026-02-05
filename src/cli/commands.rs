@@ -5,6 +5,7 @@ use crate::config::{DemonConfig, Job};
 use crate::daemon;
 use crate::gateway;
 use crate::scheduler;
+use crate::task;
 
 pub async fn start(with_gateway: bool, foreground: bool) -> Result<()> {
     let config = DemonConfig::load()?;
@@ -418,6 +419,90 @@ pub async fn uninstall() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         println!("Remove the cc-demon task from Task Scheduler manually");
+    }
+
+    Ok(())
+}
+
+// ==================== Task Commands ====================
+
+pub async fn task_run(task_name: &str, message: &str) -> Result<()> {
+    let config = DemonConfig::load()?;
+
+    // Use default message if empty
+    let msg = if message.is_empty() {
+        "Execute the task as configured"
+    } else {
+        message
+    };
+
+    println!("Running task: {}", task_name);
+    let result = task::run_task_by_name(task_name, msg, &config).await?;
+
+    println!("\n--- Output ---");
+    println!("{}", result);
+
+    Ok(())
+}
+
+pub async fn task_list() -> Result<()> {
+    let config = DemonConfig::load()?;
+    let tasks = task::load_tasks(&config)?;
+
+    if tasks.is_empty() {
+        println!("No tasks configured.");
+        println!("\nCreate ~/.demon/tasks.toml with task definitions.");
+        return Ok(());
+    }
+
+    println!("Configured Tasks ({}):", tasks.len());
+    println!(
+        "{:<20} {:<20} {:<10} {}",
+        "ID", "Agent", "Status", "Description"
+    );
+    println!("{}", "-".repeat(80));
+
+    for t in tasks {
+        let status = if t.enabled { "enabled" } else { "disabled" };
+        println!(
+            "{:<20} {:<20} {:<10} {}",
+            t.id,
+            t.agent_id,
+            status,
+            t.description.chars().take(30).collect::<String>()
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn agent_list() -> Result<()> {
+    let config = DemonConfig::load()?;
+    let agents = task::load_agents(&config)?;
+
+    if agents.is_empty() {
+        println!("No agents configured.");
+        println!("\nCreate ~/.demon/agents.toml with agent definitions.");
+        return Ok(());
+    }
+
+    println!("Configured Agents ({}):", agents.len());
+    println!(
+        "{:<20} {:<15} {:<40} {}",
+        "ID", "Model", "Working Dir", "Name"
+    );
+    println!("{}", "-".repeat(90));
+
+    for a in agents {
+        let working_dir = if a.working_dir.len() > 38 {
+            format!("...{}", &a.working_dir[a.working_dir.len() - 35..])
+        } else {
+            a.working_dir.clone()
+        };
+        println!(
+            "{:<20} {:<15} {:<40} {}",
+            a.id, a.model, working_dir, a.name
+        );
     }
 
     Ok(())

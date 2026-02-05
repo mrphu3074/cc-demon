@@ -43,6 +43,11 @@ pub enum Command {
     },
     /// Uninstall system service
     Uninstall,
+    /// Manage agent tasks
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -83,6 +88,22 @@ pub enum GatewayAction {
     Status,
 }
 
+#[derive(Subcommand)]
+pub enum TaskAction {
+    /// Run a task by name with a message
+    Run {
+        /// Task name or ID
+        name: String,
+        /// Message to pass to the agent
+        #[arg(default_value = "")]
+        message: String,
+    },
+    /// List all configured tasks
+    List,
+    /// List all configured agents
+    ListAgents,
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Start {
@@ -106,5 +127,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         },
         Command::Install { with_gateway } => commands::install(with_gateway).await,
         Command::Uninstall => commands::uninstall().await,
+        Command::Task { action } => match action {
+            TaskAction::Run { name, message } => commands::task_run(&name, &message).await,
+            TaskAction::List => commands::task_list().await,
+            TaskAction::ListAgents => commands::agent_list().await,
+        },
     }
 }

@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::formatter::MessageFormat;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DemonConfig {
     #[serde(default)]
@@ -53,6 +55,19 @@ impl PathsConfig {
     pub fn pid_file(&self) -> PathBuf {
         self.base_dir().join("demon.pid")
     }
+
+    pub fn agents_file(&self) -> PathBuf {
+        self.base_dir().join("agents.toml")
+    }
+
+    pub fn tasks_file(&self) -> PathBuf {
+        self.base_dir().join("tasks.toml")
+    }
+
+    #[allow(dead_code)]
+    pub fn task_outputs_dir(&self) -> PathBuf {
+        self.base_dir().join("task-outputs")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,8 +91,24 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub append_system_prompt: String,
     /// Seconds of inactivity before starting a new session (default: 3600 = 1 hour)
+    /// Only used when use_persistent_session is false
     #[serde(default = "default_session_timeout")]
     pub session_timeout_secs: u64,
+    /// Use persistent tmux session instead of spawning claude -p per message
+    #[serde(default)]
+    pub use_persistent_session: bool,
+    /// Tmux session name for persistent session (default: "cc-demon-gateway")
+    #[serde(default = "default_tmux_session_name")]
+    pub tmux_session_name: String,
+    /// Prompt marker to detect response completion (default: "> ")
+    #[serde(default = "default_prompt_marker")]
+    pub prompt_marker: String,
+    /// Auto-compact interval in seconds (default: 3600 = 1 hour)
+    #[serde(default = "default_compact_interval")]
+    pub compact_interval_secs: u64,
+    /// Message format for Telegram (markdownv2, html, plain)
+    #[serde(default)]
+    pub message_format: MessageFormat,
 }
 
 impl Default for GatewayConfig {
@@ -93,8 +124,25 @@ impl Default for GatewayConfig {
             disallowed_tools: Vec::new(),
             append_system_prompt: String::new(),
             session_timeout_secs: default_session_timeout(),
+            use_persistent_session: false,
+            tmux_session_name: default_tmux_session_name(),
+            prompt_marker: default_prompt_marker(),
+            compact_interval_secs: default_compact_interval(),
+            message_format: MessageFormat::default(),
         }
     }
+}
+
+fn default_tmux_session_name() -> String {
+    "cc-demon-gateway".to_string()
+}
+
+fn default_prompt_marker() -> String {
+    "❯".to_string() // Claude Code uses ❯ (U+276F) as prompt
+}
+
+fn default_compact_interval() -> u64 {
+    3600 // 1 hour
 }
 
 fn default_session_timeout() -> u64 {
@@ -214,6 +262,7 @@ impl DemonConfig {
         }
     }
 
+    #[allow(dead_code)]
     pub fn save(&self) -> Result<()> {
         let config_file = self.paths.config_file();
         std::fs::create_dir_all(config_file.parent().unwrap())?;

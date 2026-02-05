@@ -1,3 +1,5 @@
+mod telegram_client;
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::HashMap;
@@ -6,6 +8,10 @@ use teloxide::prelude::*;
 use tokio::sync::Mutex;
 
 use crate::config::DemonConfig;
+use crate::session::{SessionConfig, SessionManager};
+use crate::task;
+
+pub use telegram_client::TelegramClient;
 
 /// Tracks an active Claude session for a chat
 #[derive(Debug, Clone)]
@@ -16,22 +22,74 @@ struct ChatSession {
 
 type SessionMap = Arc<Mutex<HashMap<i64, ChatSession>>>;
 
+/// Shared state for the gateway, including optional persistent session manager.
+struct GatewayState {
+    config: DemonConfig,
+    sessions: SessionMap,
+    session_manager: Option<Arc<SessionManager>>,
+}
+
 pub async fn run(config: DemonConfig) -> Result<()> {
     tracing::info!("Starting Telegram gateway");
-    eprintln!("[demon] Starting Telegram gateway (session timeout: {}s)", config.gateway.session_timeout_secs);
 
     if config.gateway.bot_token.is_empty() {
         anyhow::bail!("Telegram bot token is not configured");
     }
 
+    // Initialize persistent session manager if enabled
+    let session_manager = if config.gateway.use_persistent_session {
+        eprintln!(
+            "[demon] Starting Telegram gateway with persistent session (tmux: '{}', compact interval: {}s)",
+            config.gateway.tmux_session_name,
+            config.gateway.compact_interval_secs
+        );
+
+        let session_config = SessionConfig {
+            session_name: config.gateway.tmux_session_name.clone(),
+            prompt_marker: config.gateway.prompt_marker.clone(),
+            poll_interval_ms: 200,
+            response_timeout_secs: config.gateway.max_turns as u64 * 30 + 60,
+            startup_timeout_secs: 60,
+            compact_interval_secs: config.gateway.compact_interval_secs,
+            max_restart_attempts: 3,
+            model: config.gateway.default_model.clone(),
+            max_turns: config.gateway.max_turns * 10, // Higher limit for persistent session
+            max_budget_usd: config.gateway.max_budget_usd * 10.0, // Higher budget for persistent session
+            allowed_tools: config.gateway.allowed_tools.clone(),
+            disallowed_tools: config.gateway.disallowed_tools.clone(),
+            append_system_prompt: config.gateway.append_system_prompt.clone(),
+        };
+
+        let manager = SessionManager::new(session_config)
+            .await
+            .context("Failed to initialize persistent session manager")?;
+
+        eprintln!("[demon] Persistent session manager initialized");
+        Some(Arc::new(manager))
+    } else {
+        eprintln!(
+            "[demon] Starting Telegram gateway (session timeout: {}s)",
+            config.gateway.session_timeout_secs
+        );
+        None
+    };
+
     let bot = Bot::new(&config.gateway.bot_token);
     let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
 
+    let state = Arc::new(GatewayState {
+        config,
+        sessions,
+        session_manager,
+    });
+
+    eprintln!("[demon] Telegram bot starting, waiting for messages...");
+
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
-        let config = config.clone();
-        let sessions = sessions.clone();
+        let state = state.clone();
         async move {
-            handle_message(bot, msg, &config, &sessions).await;
+            eprintln!("[demon] >>> Received raw message from Telegram");
+            handle_message_with_state(bot, msg, &state).await;
             Ok(())
         }
     })
@@ -40,11 +98,12 @@ pub async fn run(config: DemonConfig) -> Result<()> {
     Ok(())
 }
 
-async fn handle_message(bot: Bot, msg: Message, config: &DemonConfig, sessions: &SessionMap) {
+/// Handle message with gateway state (supports both persistent and spawn modes).
+async fn handle_message_with_state(bot: Bot, msg: Message, state: &GatewayState) {
     let chat_id = msg.chat.id.0;
 
     // Check whitelist
-    if !config.gateway.allowed_chat_ids.contains(&chat_id) {
+    if !state.config.gateway.allowed_chat_ids.contains(&chat_id) {
         tracing::warn!("Message from non-whitelisted chat: {chat_id}");
         let _ = bot
             .send_message(msg.chat.id, "This chat is not authorized to use Demon.")
@@ -60,7 +119,6 @@ async fn handle_message(bot: Bot, msg: Message, config: &DemonConfig, sessions: 
     eprintln!("[demon] Chat {chat_id}: {text}");
 
     // Send typing indicator continuously until Claude responds
-    // Telegram typing expires after ~5s, so we resend every 4s
     let typing_bot = bot.clone();
     let typing_chat_id = msg.chat.id;
     let typing_handle = tokio::spawn(async move {
@@ -72,46 +130,97 @@ async fn handle_message(bot: Bot, msg: Message, config: &DemonConfig, sessions: 
         }
     });
 
-    // Check for existing session
-    let existing_session = {
-        let map = sessions.lock().await;
-        map.get(&chat_id).cloned()
-    };
+    // Check for /task prefix - route to task system
+    if let Some(task_msg) = text.strip_prefix("/task ") {
+        eprintln!("[demon] Chat {chat_id}: /task command detected");
 
-    let resume_session_id = match existing_session {
-        Some(ref session) => {
-            let elapsed = (Utc::now() - session.last_message_at).num_seconds() as u64;
-            if elapsed < config.gateway.session_timeout_secs {
-                eprintln!(
-                    "[demon] Chat {chat_id}: resuming session {} (idle {}s)",
-                    session.session_id, elapsed
-                );
-                Some(session.session_id.clone())
-            } else {
-                eprintln!(
-                    "[demon] Chat {chat_id}: session expired (idle {}s > {}s threshold), starting new",
-                    elapsed, config.gateway.session_timeout_secs
-                );
-                None
+        match task::classify_and_execute(
+            task_msg.trim(),
+            &state.config,
+            state.session_manager.as_ref(),
+        )
+        .await
+        {
+            Ok(Some(response)) => {
+                // Task executed successfully
+                typing_handle.abort();
+
+                // Send response using TelegramClient
+                let client =
+                    TelegramClient::new(bot.clone(), state.config.gateway.message_format);
+                if let Err(e) = client.send_formatted_message(msg.chat.id, &response).await {
+                    tracing::error!("Failed to send task response: {}", e);
+                    let _ = bot
+                        .send_message(msg.chat.id, format!("Error sending response: {}", e))
+                        .await;
+                }
+                return;
+            }
+            Ok(None) => {
+                // No matching task - fall through to normal gateway
+                eprintln!("[demon] Chat {chat_id}: no matching task, falling back to gateway");
+            }
+            Err(e) => {
+                // Task execution failed
+                typing_handle.abort();
+                tracing::error!("Task execution failed: {}", e);
+                eprintln!("[demon] Chat {chat_id}: task error: {}", e);
+                let _ = bot
+                    .send_message(msg.chat.id, format!("Task error: {}", e))
+                    .await;
+                return;
             }
         }
-        None => {
-            eprintln!("[demon] Chat {chat_id}: no existing session, starting new");
-            None
-        }
-    };
+    }
 
-    // Execute via claude CLI
-    let result = execute_prompt(text, resume_session_id.as_deref(), config).await;
+    // Use persistent session if available, otherwise fall back to spawn mode
+    let result = if let Some(ref session_manager) = state.session_manager {
+        eprintln!("[demon] Chat {chat_id}: using persistent session");
+        session_manager
+            .send_message(text)
+            .await
+            .map(|response| (response, None))
+    } else {
+        // Fall back to original spawn mode
+        let existing_session = {
+            let map = state.sessions.lock().await;
+            map.get(&chat_id).cloned()
+        };
+
+        let resume_session_id = match existing_session {
+            Some(ref session) => {
+                let elapsed = (Utc::now() - session.last_message_at).num_seconds() as u64;
+                if elapsed < state.config.gateway.session_timeout_secs {
+                    eprintln!(
+                        "[demon] Chat {chat_id}: resuming session {} (idle {}s)",
+                        session.session_id, elapsed
+                    );
+                    Some(session.session_id.clone())
+                } else {
+                    eprintln!(
+                        "[demon] Chat {chat_id}: session expired (idle {}s > {}s threshold), starting new",
+                        elapsed, state.config.gateway.session_timeout_secs
+                    );
+                    None
+                }
+            }
+            None => {
+                eprintln!("[demon] Chat {chat_id}: no existing session, starting new");
+                None
+            }
+        };
+
+        execute_prompt(text, resume_session_id.as_deref(), &state.config).await
+    };
 
     // Stop typing indicator
     typing_handle.abort();
 
     match result {
         Ok((response, new_session_id)) => {
-            // Update session tracking
+            // Update session tracking (only for spawn mode)
             if let Some(sid) = new_session_id {
-                let mut map = sessions.lock().await;
+                let mut map = state.sessions.lock().await;
                 map.insert(
                     chat_id,
                     ChatSession {
@@ -122,18 +231,20 @@ async fn handle_message(bot: Bot, msg: Message, config: &DemonConfig, sessions: 
                 eprintln!("[demon] Chat {chat_id}: session stored: {sid}");
             }
 
-            // Telegram has a 4096 char limit per message
-            for chunk in split_message(&response, 4000) {
-                let _ = bot.send_message(msg.chat.id, chunk).await;
+            // Send formatted message using TelegramClient
+            let client = TelegramClient::new(bot.clone(), state.config.gateway.message_format);
+            if let Err(e) = client.send_formatted_message(msg.chat.id, &response).await {
+                tracing::error!("Failed to send formatted message: {}", e);
+                eprintln!("[demon] Failed to send message: {}", e);
             }
         }
         Err(e) => {
             tracing::error!("Failed to execute prompt: {e}");
             eprintln!("[demon] Chat {chat_id}: error: {e}");
 
-            // If resume failed, clear the session and hint the user
-            if resume_session_id.is_some() {
-                let mut map = sessions.lock().await;
+            // If using spawn mode and resume failed, clear the session
+            if state.session_manager.is_none() {
+                let mut map = state.sessions.lock().await;
                 map.remove(&chat_id);
                 eprintln!("[demon] Chat {chat_id}: cleared stale session after error");
             }
@@ -279,28 +390,4 @@ fn build_args_debug(cmd: &tokio::process::Command) -> String {
         .chars()
         .take(500)
         .collect()
-}
-
-fn split_message(text: &str, max_len: usize) -> Vec<&str> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < text.len() {
-        let end = (start + max_len).min(text.len());
-
-        // Try to split at a newline if possible
-        let split_at = if end < text.len() {
-            text[start..end]
-                .rfind('\n')
-                .map(|i| start + i + 1)
-                .unwrap_or(end)
-        } else {
-            end
-        };
-
-        chunks.push(&text[start..split_at]);
-        start = split_at;
-    }
-
-    chunks
 }
