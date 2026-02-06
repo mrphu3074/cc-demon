@@ -9,8 +9,7 @@ use crate::config::{DemonConfig, Job};
 use crate::output;
 
 pub async fn run(config: DemonConfig) -> Result<()> {
-    tracing::info!("Scheduler started");
-    eprintln!("[demon] Scheduler started, checking jobs every 30 seconds");
+    tracing::info!(component = "scheduler", "Scheduler started, checking jobs every 30 seconds");
 
     // Track which one-shot jobs have already been triggered
     let mut triggered_once_jobs: HashSet<String> = HashSet::new();
@@ -19,8 +18,7 @@ pub async fn run(config: DemonConfig) -> Result<()> {
         let jobs = match config.load_jobs() {
             Ok(jobs) => jobs,
             Err(e) => {
-                tracing::error!("Failed to load jobs: {e}");
-                eprintln!("[demon] Failed to load jobs: {e}");
+                tracing::error!(component = "scheduler", error = %e, "Failed to load jobs");
                 sleep(Duration::from_secs(60)).await;
                 continue;
             }
@@ -32,24 +30,40 @@ pub async fn run(config: DemonConfig) -> Result<()> {
         let total = jobs.len();
         let enabled = jobs.iter().filter(|j| j.enabled).count();
         let disabled = total - enabled;
-        eprintln!(
-            "[demon] Tick: UTC={} Local={} | jobs: {} total, {} enabled, {} disabled",
-            now.format("%Y-%m-%d %H:%M:%S"),
-            local_now.format("%Y-%m-%d %H:%M:%S %Z"),
-            total,
-            enabled,
-            disabled,
+
+        tracing::debug!(
+            component = "scheduler",
+            utc_time = %now.format("%Y-%m-%d %H:%M:%S"),
+            local_time = %local_now.format("%Y-%m-%d %H:%M:%S %Z"),
+            jobs_total = total,
+            jobs_enabled = enabled,
+            jobs_disabled = disabled,
+            "Scheduler tick"
         );
 
         for job in &jobs {
             if !job.enabled {
-                eprintln!("[demon]   [SKIP] '{}' ({}): disabled", job.name, job.id);
+                tracing::debug!(
+                    component = "scheduler",
+                    job_id = %job.id,
+                    job_name = %job.name,
+                    status = "skip",
+                    reason = "disabled",
+                    "Job skipped"
+                );
                 continue;
             }
 
             // Skip one-shot jobs that have already been triggered this session
             if job.schedule_type == "once" && triggered_once_jobs.contains(&job.id) {
-                eprintln!("[demon]   [SKIP] '{}' ({}): once job already triggered this session", job.name, job.id);
+                tracing::debug!(
+                    component = "scheduler",
+                    job_id = %job.id,
+                    job_name = %job.name,
+                    status = "skip",
+                    reason = "once job already triggered",
+                    "Job skipped"
+                );
                 continue;
             }
 
@@ -57,7 +71,13 @@ pub async fn run(config: DemonConfig) -> Result<()> {
                 "recurring" => should_run_recurring(job, now),
                 "once" => should_run_once(job, now),
                 _ => {
-                    eprintln!("[demon]   [ERR]  '{}' ({}): unknown schedule_type '{}'", job.name, job.id, job.schedule_type);
+                    tracing::error!(
+                        component = "scheduler",
+                        job_id = %job.id,
+                        job_name = %job.name,
+                        schedule_type = %job.schedule_type,
+                        "Unknown schedule type"
+                    );
                     false
                 }
             };
@@ -71,20 +91,40 @@ pub async fn run(config: DemonConfig) -> Result<()> {
                 let job = job.clone();
                 let config = config.clone();
                 tokio::spawn(async move {
-                    eprintln!("[demon] Executing job: {} ({})", job.name, job.id);
-                    tracing::info!("Executing job: {} ({})", job.name, job.id);
+                    tracing::info!(
+                        component = "scheduler",
+                        job_id = %job.id,
+                        job_name = %job.name,
+                        schedule_type = %job.schedule_type,
+                        "Executing job"
+                    );
+
                     match execute_job(&job, &config).await {
                         Ok(result) => {
-                            tracing::info!("Job '{}' completed successfully", job.id);
-                            eprintln!("[demon] Job '{}' completed successfully", job.id);
+                            tracing::info!(
+                                component = "scheduler",
+                                job_id = %job.id,
+                                job_name = %job.name,
+                                result_len = result.len(),
+                                "Job completed successfully"
+                            );
                             if let Err(e) = output::route(&job, &result, &config).await {
-                                tracing::error!("Failed to route output for job '{}': {e}", job.id);
-                                eprintln!("[demon] Failed to route output for job '{}': {e}", job.id);
+                                tracing::error!(
+                                    component = "scheduler",
+                                    job_id = %job.id,
+                                    error = %e,
+                                    "Failed to route output"
+                                );
                             }
                         }
                         Err(e) => {
-                            tracing::error!("Job '{}' failed: {e}", job.id);
-                            eprintln!("[demon] Job '{}' failed: {e}", job.id);
+                            tracing::error!(
+                                component = "scheduler",
+                                job_id = %job.id,
+                                job_name = %job.name,
+                                error = %e,
+                                "Job execution failed"
+                            );
                         }
                     }
 
@@ -94,10 +134,18 @@ pub async fn run(config: DemonConfig) -> Result<()> {
                             if let Some(j) = jobs.iter_mut().find(|j| j.id == job.id) {
                                 j.enabled = false;
                                 if let Err(e) = config.save_jobs(&jobs) {
-                                    tracing::error!("Failed to disable one-shot job '{}': {e}", job.id);
+                                    tracing::error!(
+                                        component = "scheduler",
+                                        job_id = %job.id,
+                                        error = %e,
+                                        "Failed to disable one-shot job"
+                                    );
                                 } else {
-                                    tracing::info!("One-shot job '{}' disabled after execution", job.id);
-                                    eprintln!("[demon] One-shot job '{}' disabled after execution", job.id);
+                                    tracing::info!(
+                                        component = "scheduler",
+                                        job_id = %job.id,
+                                        "One-shot job disabled after execution"
+                                    );
                                 }
                             }
                         }
@@ -115,9 +163,13 @@ fn should_run_recurring(job: &Job, now: chrono::DateTime<Utc>) -> bool {
     let schedule = match Schedule::from_str(&job.schedule) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
-                "[demon]   [ERR]  '{}' ({}): invalid cron '{}': {e}",
-                job.name, job.id, job.schedule
+            tracing::error!(
+                component = "scheduler",
+                job_id = %job.id,
+                job_name = %job.name,
+                cron = %job.schedule,
+                error = %e,
+                "Invalid cron expression"
             );
             return false;
         }
@@ -128,27 +180,36 @@ fn should_run_recurring(job: &Job, now: chrono::DateTime<Utc>) -> bool {
         let diff = next - now;
         let next_local = next.with_timezone(&Local);
         let should = diff.num_seconds() <= 30 && diff.num_seconds() >= 0;
+
         if should {
-            eprintln!(
-                "[demon]   [FIRE] '{}' ({}): cron='{}' firing now",
-                job.name, job.id, job.schedule,
+            tracing::info!(
+                component = "scheduler",
+                job_id = %job.id,
+                job_name = %job.name,
+                cron = %job.schedule,
+                status = "fire",
+                "Job firing now"
             );
         } else {
-            eprintln!(
-                "[demon]   [WAIT] '{}' ({}): cron='{}' next={} (local {}) in {}",
-                job.name,
-                job.id,
-                job.schedule,
-                next.format("%Y-%m-%d %H:%M:%S UTC"),
-                next_local.format("%H:%M:%S %Z"),
-                format_duration(diff.num_seconds()),
+            tracing::debug!(
+                component = "scheduler",
+                job_id = %job.id,
+                job_name = %job.name,
+                cron = %job.schedule,
+                next_utc = %next.format("%Y-%m-%d %H:%M:%S UTC"),
+                next_local = %next_local.format("%H:%M:%S %Z"),
+                wait_duration = %format_duration(diff.num_seconds()),
+                status = "wait",
+                "Job waiting"
             );
         }
         should
     } else {
-        eprintln!(
-            "[demon]   [ERR]  '{}' ({}): no upcoming schedule found",
-            job.name, job.id
+        tracing::error!(
+            component = "scheduler",
+            job_id = %job.id,
+            job_name = %job.name,
+            "No upcoming schedule found"
         );
         false
     }
@@ -156,9 +217,11 @@ fn should_run_recurring(job: &Job, now: chrono::DateTime<Utc>) -> bool {
 
 fn should_run_once(job: &Job, now: chrono::DateTime<Utc>) -> bool {
     let Some(ref once_at) = job.once_at else {
-        eprintln!(
-            "[demon]   [ERR]  '{}' ({}): once job missing once_at field",
-            job.name, job.id
+        tracing::error!(
+            component = "scheduler",
+            job_id = %job.id,
+            job_name = %job.name,
+            "Once job missing once_at field"
         );
         return false;
     };
@@ -166,9 +229,12 @@ fn should_run_once(job: &Job, now: chrono::DateTime<Utc>) -> bool {
     let target = match parse_datetime(once_at) {
         Some(t) => t,
         None => {
-            eprintln!(
-                "[demon]   [ERR]  '{}' ({}): invalid once_at '{}'",
-                job.name, job.id, once_at
+            tracing::error!(
+                component = "scheduler",
+                job_id = %job.id,
+                job_name = %job.name,
+                once_at = %once_at,
+                "Invalid once_at datetime format"
             );
             return false;
         }
@@ -179,26 +245,34 @@ fn should_run_once(job: &Job, now: chrono::DateTime<Utc>) -> bool {
     let target_local = target.with_timezone(&Local);
 
     if should {
-        eprintln!(
-            "[demon]   [FIRE] '{}' ({}): once_at={} firing now",
-            job.name, job.id, once_at,
+        tracing::info!(
+            component = "scheduler",
+            job_id = %job.id,
+            job_name = %job.name,
+            once_at = %once_at,
+            status = "fire",
+            "Once job firing now"
         );
     } else if diff > 0 {
-        eprintln!(
-            "[demon]   [WAIT] '{}' ({}): once_at {} (local {}) in {}",
-            job.name,
-            job.id,
-            target.format("%Y-%m-%d %H:%M:%S UTC"),
-            target_local.format("%H:%M:%S %Z"),
-            format_duration(diff),
+        tracing::debug!(
+            component = "scheduler",
+            job_id = %job.id,
+            job_name = %job.name,
+            target_utc = %target.format("%Y-%m-%d %H:%M:%S UTC"),
+            target_local = %target_local.format("%H:%M:%S %Z"),
+            wait_duration = %format_duration(diff),
+            status = "wait",
+            "Once job waiting"
         );
     } else {
-        eprintln!(
-            "[demon]   [MISS] '{}' ({}): once_at {} was {} ago (missed)",
-            job.name,
-            job.id,
-            once_at,
-            format_duration(-diff),
+        tracing::warn!(
+            component = "scheduler",
+            job_id = %job.id,
+            job_name = %job.name,
+            once_at = %once_at,
+            missed_by = %format_duration(-diff),
+            status = "miss",
+            "Once job missed its scheduled time"
         );
     }
 
@@ -309,6 +383,14 @@ pub async fn execute_job(job: &Job, _config: &DemonConfig) -> Result<String> {
 
     // The prompt
     cmd.arg(&job.prompt);
+
+    tracing::debug!(
+        component = "scheduler",
+        job_id = %job.id,
+        model = %job.model,
+        working_dir = %job.working_dir,
+        "Spawning claude CLI"
+    );
 
     let output = cmd
         .output()

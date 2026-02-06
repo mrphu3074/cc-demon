@@ -43,10 +43,31 @@ pub enum Command {
     },
     /// Uninstall system service
     Uninstall,
+    /// Initialize demon configuration and directory structure
+    Init {
+        /// Also configure Telegram gateway interactively
+        #[arg(long)]
+        with_gateway: bool,
+    },
     /// Manage agent tasks
     Task {
         #[command(subcommand)]
         action: TaskAction,
+    },
+    /// View daemon logs with hl
+    Logs {
+        /// Follow log output in real-time (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+        /// Show only the last N lines
+        #[arg(short = 'n', long)]
+        tail: Option<usize>,
+        /// Filter by log level (debug, info, warn, error)
+        #[arg(short, long)]
+        level: Option<String>,
+        /// Raw output without hl (for piping)
+        #[arg(long)]
+        raw: bool,
     },
 }
 
@@ -127,10 +148,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         },
         Command::Install { with_gateway } => commands::install(with_gateway).await,
         Command::Uninstall => commands::uninstall().await,
+        Command::Init { with_gateway } => commands::init(with_gateway).await,
         Command::Task { action } => match action {
             TaskAction::Run { name, message } => commands::task_run(&name, &message).await,
             TaskAction::List => commands::task_list().await,
             TaskAction::ListAgents => commands::agent_list().await,
         },
+        Command::Logs { follow, tail, level, raw } => {
+            commands::logs(follow, tail, level, raw).await
+        }
     }
 }

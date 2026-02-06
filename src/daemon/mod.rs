@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::config::{DemonConfig, PathsConfig};
+use crate::logging;
 
 fn pid_file() -> PathBuf {
     PathsConfig::default().pid_file()
@@ -99,22 +100,8 @@ pub fn signal_reload(pid: i32) -> Result<()> {
     }
 }
 
-fn init_daemon_logging(config: &DemonConfig) -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    let log_dir = config.paths.logs_dir();
-    fs::create_dir_all(&log_dir)?;
-
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "demon.log");
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(non_blocking)
-        .init();
-
-    Ok(guard)
+fn init_daemon_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    logging::init_daemon_logging()
 }
 
 pub fn daemonize(with_gateway: bool) -> Result<()> {
@@ -145,28 +132,25 @@ pub fn daemonize(with_gateway: bool) -> Result<()> {
             let config = DemonConfig::load()?;
 
             // Initialize logging for daemon mode
-            let _guard = init_daemon_logging(&config)?;
-            tracing::info!("Daemon started (PID: {})", std::process::id());
-            eprintln!("[demon] Daemon started (PID: {})", std::process::id());
+            let _guard = init_daemon_logging()?;
+            tracing::info!(component = "daemon", pid = std::process::id(), "Daemon started");
 
             let scheduler_handle = tokio::spawn({
                 let config = config.clone();
                 async move {
                     if let Err(e) = crate::scheduler::run(config).await {
-                        tracing::error!("Scheduler error: {e}");
-                        eprintln!("[demon] Scheduler error: {e}");
+                        tracing::error!(component = "daemon", error = %e, "Scheduler error");
                     }
                 }
             });
 
             let gateway_handle = if with_gateway {
-                tracing::info!("Starting gateway in daemon mode");
+                tracing::info!(component = "daemon", "Starting gateway in daemon mode");
                 Some(tokio::spawn({
                     let config = config.clone();
                     async move {
                         if let Err(e) = crate::gateway::run(config).await {
-                            tracing::error!("Gateway error: {e}");
-                            eprintln!("[demon] Gateway error: {e}");
+                            tracing::error!(component = "daemon", error = %e, "Gateway error");
                         }
                     }
                 }))
@@ -177,7 +161,7 @@ pub fn daemonize(with_gateway: bool) -> Result<()> {
             // Wait for either task to complete (they shouldn't under normal operation)
             tokio::select! {
                 result = scheduler_handle => {
-                    tracing::error!("Scheduler unexpectedly exited: {:?}", result);
+                    tracing::error!(component = "daemon", result = ?result, "Scheduler unexpectedly exited");
                 }
                 result = async {
                     if let Some(h) = gateway_handle {
@@ -187,7 +171,7 @@ pub fn daemonize(with_gateway: bool) -> Result<()> {
                         std::future::pending::<Result<(), tokio::task::JoinError>>().await
                     }
                 } => {
-                    tracing::error!("Gateway unexpectedly exited: {:?}", result);
+                    tracing::error!(component = "daemon", result = ?result, "Gateway unexpectedly exited");
                 }
             }
 

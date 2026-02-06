@@ -30,7 +30,7 @@ struct GatewayState {
 }
 
 pub async fn run(config: DemonConfig) -> Result<()> {
-    tracing::info!("Starting Telegram gateway");
+    tracing::info!(component = "gateway", "Starting Telegram gateway");
 
     if config.gateway.bot_token.is_empty() {
         anyhow::bail!("Telegram bot token is not configured");
@@ -38,10 +38,11 @@ pub async fn run(config: DemonConfig) -> Result<()> {
 
     // Initialize persistent session manager if enabled
     let session_manager = if config.gateway.use_persistent_session {
-        eprintln!(
-            "[demon] Starting Telegram gateway with persistent session (tmux: '{}', compact interval: {}s)",
-            config.gateway.tmux_session_name,
-            config.gateway.compact_interval_secs
+        tracing::info!(
+            component = "gateway",
+            tmux_session = %config.gateway.tmux_session_name,
+            compact_interval_secs = config.gateway.compact_interval_secs,
+            "Starting with persistent session"
         );
 
         let session_config = SessionConfig {
@@ -64,12 +65,13 @@ pub async fn run(config: DemonConfig) -> Result<()> {
             .await
             .context("Failed to initialize persistent session manager")?;
 
-        eprintln!("[demon] Persistent session manager initialized");
+        tracing::info!(component = "gateway", "Persistent session manager initialized");
         Some(Arc::new(manager))
     } else {
-        eprintln!(
-            "[demon] Starting Telegram gateway (session timeout: {}s)",
-            config.gateway.session_timeout_secs
+        tracing::info!(
+            component = "gateway",
+            session_timeout_secs = config.gateway.session_timeout_secs,
+            "Starting with spawn mode"
         );
         None
     };
@@ -83,12 +85,12 @@ pub async fn run(config: DemonConfig) -> Result<()> {
         session_manager,
     });
 
-    eprintln!("[demon] Telegram bot starting, waiting for messages...");
+    tracing::info!(component = "gateway", "Telegram bot ready, waiting for messages");
 
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let state = state.clone();
         async move {
-            eprintln!("[demon] >>> Received raw message from Telegram");
+            tracing::debug!(component = "gateway", "Received raw message from Telegram");
             handle_message_with_state(bot, msg, &state).await;
             Ok(())
         }
@@ -104,7 +106,11 @@ async fn handle_message_with_state(bot: Bot, msg: Message, state: &GatewayState)
 
     // Check whitelist
     if !state.config.gateway.allowed_chat_ids.contains(&chat_id) {
-        tracing::warn!("Message from non-whitelisted chat: {chat_id}");
+        tracing::warn!(
+            component = "gateway",
+            chat_id = chat_id,
+            "Message from non-whitelisted chat"
+        );
         let _ = bot
             .send_message(msg.chat.id, "This chat is not authorized to use Demon.")
             .await;
@@ -115,8 +121,12 @@ async fn handle_message_with_state(bot: Bot, msg: Message, state: &GatewayState)
         return;
     };
 
-    tracing::info!("Received message from chat {chat_id}: {text}");
-    eprintln!("[demon] Chat {chat_id}: {text}");
+    tracing::info!(
+        component = "gateway",
+        chat_id = chat_id,
+        message_len = text.len(),
+        "Received message"
+    );
 
     // Send typing indicator continuously until Claude responds
     let typing_bot = bot.clone();
@@ -132,7 +142,11 @@ async fn handle_message_with_state(bot: Bot, msg: Message, state: &GatewayState)
 
     // Check for /task prefix - route to task system
     if let Some(task_msg) = text.strip_prefix("/task ") {
-        eprintln!("[demon] Chat {chat_id}: /task command detected");
+        tracing::info!(
+            component = "gateway",
+            chat_id = chat_id,
+            "Task command detected"
+        );
 
         match task::classify_and_execute(
             task_msg.trim(),
@@ -145,11 +159,23 @@ async fn handle_message_with_state(bot: Bot, msg: Message, state: &GatewayState)
                 // Task executed successfully
                 typing_handle.abort();
 
+                tracing::info!(
+                    component = "gateway",
+                    chat_id = chat_id,
+                    response_len = response.len(),
+                    "Task executed successfully"
+                );
+
                 // Send response using TelegramClient
                 let client =
                     TelegramClient::new(bot.clone(), state.config.gateway.message_format);
                 if let Err(e) = client.send_formatted_message(msg.chat.id, &response).await {
-                    tracing::error!("Failed to send task response: {}", e);
+                    tracing::error!(
+                        component = "gateway",
+                        chat_id = chat_id,
+                        error = %e,
+                        "Failed to send task response"
+                    );
                     let _ = bot
                         .send_message(msg.chat.id, format!("Error sending response: {}", e))
                         .await;
@@ -158,13 +184,21 @@ async fn handle_message_with_state(bot: Bot, msg: Message, state: &GatewayState)
             }
             Ok(None) => {
                 // No matching task - fall through to normal gateway
-                eprintln!("[demon] Chat {chat_id}: no matching task, falling back to gateway");
+                tracing::debug!(
+                    component = "gateway",
+                    chat_id = chat_id,
+                    "No matching task, falling back to gateway"
+                );
             }
             Err(e) => {
                 // Task execution failed
                 typing_handle.abort();
-                tracing::error!("Task execution failed: {}", e);
-                eprintln!("[demon] Chat {chat_id}: task error: {}", e);
+                tracing::error!(
+                    component = "gateway",
+                    chat_id = chat_id,
+                    error = %e,
+                    "Task execution failed"
+                );
                 let _ = bot
                     .send_message(msg.chat.id, format!("Task error: {}", e))
                     .await;
@@ -175,7 +209,11 @@ async fn handle_message_with_state(bot: Bot, msg: Message, state: &GatewayState)
 
     // Use persistent session if available, otherwise fall back to spawn mode
     let result = if let Some(ref session_manager) = state.session_manager {
-        eprintln!("[demon] Chat {chat_id}: using persistent session");
+        tracing::debug!(
+            component = "gateway",
+            chat_id = chat_id,
+            "Using persistent session"
+        );
         session_manager
             .send_message(text)
             .await
@@ -191,26 +229,36 @@ async fn handle_message_with_state(bot: Bot, msg: Message, state: &GatewayState)
             Some(ref session) => {
                 let elapsed = (Utc::now() - session.last_message_at).num_seconds() as u64;
                 if elapsed < state.config.gateway.session_timeout_secs {
-                    eprintln!(
-                        "[demon] Chat {chat_id}: resuming session {} (idle {}s)",
-                        session.session_id, elapsed
+                    tracing::debug!(
+                        component = "gateway",
+                        chat_id = chat_id,
+                        session_id = %session.session_id,
+                        idle_secs = elapsed,
+                        "Resuming existing session"
                     );
                     Some(session.session_id.clone())
                 } else {
-                    eprintln!(
-                        "[demon] Chat {chat_id}: session expired (idle {}s > {}s threshold), starting new",
-                        elapsed, state.config.gateway.session_timeout_secs
+                    tracing::debug!(
+                        component = "gateway",
+                        chat_id = chat_id,
+                        idle_secs = elapsed,
+                        timeout_secs = state.config.gateway.session_timeout_secs,
+                        "Session expired, starting new"
                     );
                     None
                 }
             }
             None => {
-                eprintln!("[demon] Chat {chat_id}: no existing session, starting new");
+                tracing::debug!(
+                    component = "gateway",
+                    chat_id = chat_id,
+                    "No existing session, starting new"
+                );
                 None
             }
         };
 
-        execute_prompt(text, resume_session_id.as_deref(), &state.config).await
+        execute_prompt(text, resume_session_id.as_deref(), &state.config, chat_id).await
     };
 
     // Stop typing indicator
@@ -219,7 +267,7 @@ async fn handle_message_with_state(bot: Bot, msg: Message, state: &GatewayState)
     match result {
         Ok((response, new_session_id)) => {
             // Update session tracking (only for spawn mode)
-            if let Some(sid) = new_session_id {
+            if let Some(ref sid) = new_session_id {
                 let mut map = state.sessions.lock().await;
                 map.insert(
                     chat_id,
@@ -228,25 +276,42 @@ async fn handle_message_with_state(bot: Bot, msg: Message, state: &GatewayState)
                         last_message_at: Utc::now(),
                     },
                 );
-                eprintln!("[demon] Chat {chat_id}: session stored: {sid}");
+                tracing::debug!(
+                    component = "gateway",
+                    chat_id = chat_id,
+                    session_id = %sid,
+                    "Session stored"
+                );
             }
 
             // Send formatted message using TelegramClient
             let client = TelegramClient::new(bot.clone(), state.config.gateway.message_format);
             if let Err(e) = client.send_formatted_message(msg.chat.id, &response).await {
-                tracing::error!("Failed to send formatted message: {}", e);
-                eprintln!("[demon] Failed to send message: {}", e);
+                tracing::error!(
+                    component = "gateway",
+                    chat_id = chat_id,
+                    error = %e,
+                    "Failed to send formatted message"
+                );
             }
         }
         Err(e) => {
-            tracing::error!("Failed to execute prompt: {e}");
-            eprintln!("[demon] Chat {chat_id}: error: {e}");
+            tracing::error!(
+                component = "gateway",
+                chat_id = chat_id,
+                error = %e,
+                "Failed to execute prompt"
+            );
 
             // If using spawn mode and resume failed, clear the session
             if state.session_manager.is_none() {
                 let mut map = state.sessions.lock().await;
                 map.remove(&chat_id);
-                eprintln!("[demon] Chat {chat_id}: cleared stale session after error");
+                tracing::debug!(
+                    component = "gateway",
+                    chat_id = chat_id,
+                    "Cleared stale session after error"
+                );
             }
 
             let _ = bot
@@ -262,6 +327,7 @@ async fn execute_prompt(
     prompt: &str,
     resume_session_id: Option<&str>,
     config: &DemonConfig,
+    chat_id: i64,
 ) -> Result<(String, Option<String>)> {
     let mut cmd = tokio::process::Command::new("claude");
     cmd.arg("-p");
@@ -298,8 +364,13 @@ async fn execute_prompt(
 
     cmd.arg(prompt);
 
-    // Log the full command for debugging
-    eprintln!("[demon] Spawning: claude {}", build_args_debug(&cmd));
+    tracing::debug!(
+        component = "gateway",
+        chat_id = chat_id,
+        model = %config.gateway.default_model,
+        resume_session = resume_session_id.is_some(),
+        "Spawning claude CLI"
+    );
 
     // Spawn with piped outputs so we can capture both
     cmd.stdout(std::process::Stdio::piped());
@@ -307,7 +378,13 @@ async fn execute_prompt(
 
     let child = cmd.spawn().context("Failed to spawn claude CLI")?;
     let pid = child.id().unwrap_or(0);
-    eprintln!("[demon] claude process started (PID: {pid})");
+
+    tracing::debug!(
+        component = "gateway",
+        chat_id = chat_id,
+        pid = pid,
+        "Claude process started"
+    );
 
     // Wait with timeout
     let timeout_secs = config.gateway.max_turns as u64 * 30 + 60;
@@ -324,7 +401,13 @@ async fn execute_prompt(
         }
         Err(_) => {
             // Timeout - kill the process by PID
-            eprintln!("[demon] claude process timed out after {timeout_secs}s, killing PID {pid}");
+            tracing::warn!(
+                component = "gateway",
+                chat_id = chat_id,
+                pid = pid,
+                timeout_secs = timeout_secs,
+                "Claude process timed out, killing"
+            );
             #[cfg(unix)]
             {
                 let _ = nix::sys::signal::kill(
@@ -339,15 +422,22 @@ async fn execute_prompt(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Always log stderr for debugging
+    // Log stderr for debugging
     if !stderr.is_empty() {
-        eprintln!("[demon] claude stderr: {stderr}");
+        tracing::debug!(
+            component = "gateway",
+            chat_id = chat_id,
+            stderr = %stderr,
+            "Claude stderr output"
+        );
     }
 
-    eprintln!(
-        "[demon] claude exited with status: {} (stdout: {} bytes)",
-        output.status,
-        stdout.len()
+    tracing::debug!(
+        component = "gateway",
+        chat_id = chat_id,
+        status = %output.status,
+        stdout_len = stdout.len(),
+        "Claude process exited"
     );
 
     if output.status.success() {
@@ -363,14 +453,25 @@ async fn execute_prompt(
                     .get("session_id")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+
                 if let Some(ref sid) = session_id {
-                    eprintln!("[demon] session_id: {sid}");
+                    tracing::debug!(
+                        component = "gateway",
+                        chat_id = chat_id,
+                        session_id = %sid,
+                        "Got session ID from response"
+                    );
                 }
+
                 Ok((result_text, session_id))
             }
             Err(e) => {
-                eprintln!("[demon] Failed to parse JSON response: {e}");
-                eprintln!("[demon] Raw stdout: {stdout}");
+                tracing::warn!(
+                    component = "gateway",
+                    chat_id = chat_id,
+                    error = %e,
+                    "Failed to parse JSON response, using raw output"
+                );
                 Ok((stdout.to_string(), None))
             }
         }
@@ -382,12 +483,4 @@ async fn execute_prompt(
             &stdout[..stdout.len().min(200)]
         )
     }
-}
-
-fn build_args_debug(cmd: &tokio::process::Command) -> String {
-    format!("{:?}", cmd)
-        .replace("Command { std: ", "")
-        .chars()
-        .take(500)
-        .collect()
 }

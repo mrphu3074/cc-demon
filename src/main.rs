@@ -3,6 +3,7 @@ mod config;
 mod daemon;
 mod formatter;
 mod gateway;
+mod logging;
 mod output;
 mod scheduler;
 mod session;
